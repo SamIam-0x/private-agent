@@ -160,7 +160,7 @@ def tool_list_files(args: dict) -> str:
         target = resolve(args.get("path", ""))
     except LookupError:
         roots = shared_roots()
-        return "\n".join(f"{name}/" for name in roots) or "No folders are shared. Sam can add some in Settings."
+        return "\n".join(f"{name}/" for name in roots) or "No folders are shared. Add some in Settings."
     if not target.is_dir():
         return "not a folder"
     lines = []

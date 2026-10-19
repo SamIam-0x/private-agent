@@ -17,11 +17,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MAX_BODY = 8_000_000
 MODEL = os.environ.get("MODEL", "kimi-k3")
 
-SYSTEM_PROMPT = """You are a private assistant for one person, Sam. He asks you personal, financial, legal, and medical questions he would not put into a normal chatbot. Answer directly and specifically. Give real numbers, names, and next steps. Say when you are unsure. Recommend a professional only when the situation calls for one, and still answer the question.
+SYSTEM_PROMPT = """You are a private assistant for one user. Answer directly and specifically. Give real numbers, names, and next steps. Say when you are unsure. Recommend a professional only when the situation calls for one, and still answer the question.
 
 You can use these tools:
-- Web search, built in. Search when the answer depends on current facts, prices, laws, or news. Write search queries in generic terms. Never put Sam's name, account numbers, addresses, or other identifying details in a search query.
-- list_files, read_file, search_files. These read files in folders Sam has shared from his Mac. Use them when he refers to his documents, notes, statements, or records. Paths are relative to a shared folder.
+- Web search, built in. Search when the answer depends on current facts, prices, laws, or news. Write search queries in generic terms. Never put the user's name, account numbers, addresses, or other identifying details in a search query.
+- list_files, read_file, search_files. These read files in folders the user has shared from their computer. Use them when the user refers to their documents, notes, statements, or records. Paths are relative to a shared folder.
 
 Cite web sources inline as markdown links. When you used a file, name it."""
 
@@ -30,7 +30,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and folders in Sam's shared folders on his Mac. Use an empty path for the top level.",
+            "description": "List files and folders in the user's shared folders. Use an empty path for the top level.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "Folder path relative to the shared folders. Empty for the top level."}},
@@ -42,7 +42,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text, markdown, CSV, JSON, or PDF file from Sam's shared folders. Long files are cut off.",
+            "description": "Read a text, markdown, CSV, JSON, or PDF file from the user's shared folders. Long files are cut off.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "File path as shown by list_files."}},
@@ -54,7 +54,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": "Search file names and text inside Sam's shared folders. Returns matching paths with short snippets.",
+            "description": "Search file names and text inside the user's shared folders. Returns matching paths with short snippets.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Words to look for."}},
@@ -179,16 +179,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         # Read the body before any early reply. The shim reuses connections, so an
-        # unread body would be parsed as the start of the next request.
+        # unread body would be parsed as the start of the next request. After the
+        # shim decrypts an EHBP request it forwards the body chunked.
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = -1
-        if length < 0 or length > MAX_BODY or self.headers.get("Transfer-Encoding"):
+            raw = self._read_body()
+        except ValueError as exc:
             self.close_connection = True
-            self._send(400, {"error": "body is missing or too large"})
+            self._send(400, {"error": str(exc)})
             return
-        raw = self.rfile.read(length) if length else b""
         if self.path.split("?", 1)[0] != "/chat":
             self._send(404, {"error": "not found"})
             return
@@ -215,6 +213,35 @@ class Handler(BaseHTTPRequestHandler):
             return
         log(f"chat status=200 type={result['type']} ms={_ms(started)}")
         self._send(200, result)
+
+    def _read_body(self) -> bytes:
+        encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in encoding:
+            parts, total = [], 0
+            while True:
+                line = self.rfile.readline(1024)
+                try:
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    raise ValueError("bad chunked body")
+                if size == 0:
+                    while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
+                        pass  # trailers
+                    return b"".join(parts)
+                total += size
+                if total > MAX_BODY:
+                    raise ValueError("body too large")
+                parts.append(self.rfile.read(size))
+                self.rfile.readline(1024)  # CRLF after each chunk
+        if encoding:
+            raise ValueError("unsupported transfer encoding")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("bad content length")
+        if length < 0 or length > MAX_BODY:
+            raise ValueError("body too large")
+        return self.rfile.read(length) if length else b""
 
     def _send(self, status: int, payload: dict) -> None:
         raw = json.dumps(payload).encode()
