@@ -16,6 +16,13 @@ containers:
     env:
       - MODEL: "kimi-k3"
       - PORT: "8080"
+      # The root filesystem is read-only. The Tinfoil SDK and sigstore write
+      # small cache files under HOME and XDG dirs, so send those to /tmp.
+      - HOME: "/tmp/home"
+      - XDG_CACHE_HOME: "/tmp/cache"
+      - XDG_DATA_HOME: "/tmp/data"
+    tmpfs:
+      /tmp: "size=64m"
     secrets:
       - TINFOIL_API_KEY
       - AGENT_TOKEN

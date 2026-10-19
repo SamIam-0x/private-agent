@@ -261,6 +261,10 @@ def main() -> None:
     if missing:
         log("missing required environment: " + ", ".join(missing))
         sys.exit(1)
+    # The enclave's root filesystem is read-only; the config points these at a tmpfs.
+    for name in ("HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"):
+        if os.environ.get(name):
+            os.makedirs(os.environ[name], exist_ok=True)
     port = int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     log(f"listening on {port} model={MODEL}")
