@@ -11,7 +11,7 @@ networks:
 
 containers:
   - name: agent
-    image: "ghcr.io/samiam-0x/private-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    image: "ghcr.io/samiam-0x/private-agent@sha256:d45a8f17846f6c8e93261b092f1167d672f7da3de07d398d7e3ffb8123aaa6bb" # v0.0.4
     networks: [public]
     env:
       - MODEL: "kimi-k3"
