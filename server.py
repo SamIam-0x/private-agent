@@ -178,22 +178,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        # Read the body before any early reply. The shim reuses connections, so an
+        # unread body would be parsed as the start of the next request.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY or self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._send(400, {"error": "body is missing or too large"})
+            return
+        raw = self.rfile.read(length) if length else b""
         if self.path.split("?", 1)[0] != "/chat":
             self._send(404, {"error": "not found"})
             return
         if not authorized(self.headers.get("Authorization", "")):
             self._send(401, {"error": "unauthorized"})
             return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = -1
-        if length <= 0 or length > MAX_BODY:
-            self._send(400, {"error": "body is empty or too large"})
+        if not raw:
+            self._send(400, {"error": "body is empty"})
             return
         started = time.monotonic()
         try:
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(raw)
             if not isinstance(body, dict):
                 raise ValueError("body must be an object")
             result = run_turn(body)
