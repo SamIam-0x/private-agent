@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
+<meta name="referrer" content="no-referrer">
+<title>Private Agent</title>
+<style>
+  :root { --bg:#0f1115; --panel:#161a21; --line:#262c36; --fg:#e6e9ef; --muted:#8b93a3; --accent:#5aa9ff; --ok:#3fb950; --bad:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--fg); display:flex; height:100vh; }
+  aside { width:260px; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  aside header { padding:14px; border-bottom:1px solid var(--line); }
+  button { background:var(--line); color:var(--fg); border:0; border-radius:8px; padding:8px 12px; cursor:pointer; font:inherit; }
+  button.primary { background:var(--accent); color:#04121f; font-weight:600; }
+  button:disabled { opacity:.5; cursor:default; }
+  #chats { flex:1; overflow:auto; padding:6px; }
+  .chat-item { padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; justify-content:space-between; gap:6px; color:var(--muted); }
+  .chat-item:hover, .chat-item.active { background:var(--line); color:var(--fg); }
+  .chat-item span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chat-item .del { visibility:hidden; color:var(--muted); }
+  .chat-item:hover .del { visibility:visible; }
+  aside footer { padding:12px 14px; border-top:1px solid var(--line); font-size:13px; color:var(--muted); }
+  main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #status { padding:10px 20px; border-bottom:1px solid var(--line); font-size:13px; color:var(--muted); display:flex; gap:16px; align-items:center; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--muted); margin-right:6px; }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
+  #log { flex:1; overflow:auto; padding:24px max(20px, calc(50% - 380px)); }
+  .msg { margin:0 0 18px; }
+  .msg.user { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px 14px; white-space:pre-wrap; }
+  .msg.tool { font-size:12px; color:var(--muted); }
+  .msg.assistant pre { background:var(--panel); padding:10px; border-radius:8px; overflow:auto; }
+  .msg.assistant code { background:var(--panel); padding:1px 4px; border-radius:4px; }
+  .msg a { color:var(--accent); }
+  .cites { font-size:12px; color:var(--muted); margin-top:6px; }
+  form { display:flex; gap:10px; padding:14px max(20px, calc(50% - 380px)) 20px; border-top:1px solid var(--line); }
+  textarea { flex:1; resize:none; height:70px; background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:10px; font:inherit; }
+  dialog { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:12px; width:520px; }
+  dialog textarea { width:100%; height:120px; }
+  label { display:block; margin:10px 0 4px; }
+  .muted { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<aside>
+  <header><button class="primary" id="new">+ New chat</button></header>
+  <div id="chats"></div>
+  <footer><a href="#" id="open-settings" style="color:var(--muted)">Settings</a></footer>
+</aside>
+<main>
+  <div id="status"><span><span class="dot" id="vdot"></span><span id="vtext">Checking enclave…</span></span></div>
+  <div id="log"></div>
+  <form id="form">
+    <textarea id="input" placeholder="Ask anything. Enter to send, Shift+Enter for a new line."></textarea>
+    <button class="primary" id="send">Send</button>
+  </form>
+</main>
+
+<dialog id="settings">
+  <h3 style="margin-top:0">Settings</h3>
+  <label>Folders the agent may read (one per line)</label>
+  <textarea id="folders" placeholder="~/Documents/Taxes&#10;~/Documents/GitHub/notes"></textarea>
+  <p class="muted">Only these folders are visible to the agent. File contents are sent to the enclave when the agent reads them.</p>
+  <label><input type="checkbox" id="websearch"> Allow web search</label>
+  <p class="muted">Searches go from the enclave to Exa (no data retention). Tinfoil masks personal details in queries, but don't count on that for names and account numbers.</p>
+  <div style="display:flex; gap:8px; justify-content:flex-end"><button id="close-settings">Cancel</button><button class="primary" id="save-settings">Save</button></div>
+</dialog>
+
+<script>
+const SESSION = "__SESSION__";
+let current = null;
+
+async function api(path, body = {}) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Session": SESSION }, body: JSON.stringify(body) });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+function esc(s) { return s.replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c])); }
+
+// Minimal markdown. Safe for innerHTML: the text is HTML-escaped first, then only
+// fixed tags and http(s) links are added. The page CSP also blocks outside scripts.
+function md(src) {
+  const blocks = [];
+  src = src.replace(/```[\w-]*\n([\s\S]*?)```/g, (_, code) => { blocks.push(code); return `\u0000${blocks.length - 1}\u0000`; });
+  let h = esc(src);
+  h = h.replace(/`([^`\n]+)`/g, "<code>$1</code>")
+       .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+       .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+       .replace(/^#{1,6} (.*)$/gm, "<strong>$1</strong>")
+       .replace(/^\s*[-*] (.*)$/gm, "• $1")
+       .replace(/\n/g, "<br>");
+  return h.replace(/\u0000(\d+)\u0000/g, (_, i) => `<pre><code>${esc(blocks[i])}</code></pre>`);
+}
+
+function render(chat) {
+  const log = document.getElementById("log");
+  log.innerHTML = "";
+  for (const m of (chat ? chat.messages : [])) {
+    const div = document.createElement("div");
+    if (m.role === "user") { div.className = "msg user"; div.textContent = m.content; }
+    else if (m.role === "tool") { div.className = "msg tool"; div.textContent = `📄 ${m.name || "file tool"} ran on this Mac`; }
+    else if (m.role === "assistant") {
+      if (m.tool_calls && m.tool_calls.length) {
+        div.className = "msg tool";
+        div.textContent = "→ " + m.tool_calls.map(c => `${c.function.name}(${c.function.arguments})`).join(", ");
+      } else {
+        div.className = "msg assistant";
+        div.innerHTML = md(m.content || "");
+        if (m.citations && m.citations.length) {
+          const c = document.createElement("div"); c.className = "cites";
+          // Safe: every value is escaped, and only http(s) URLs are kept.
+          c.innerHTML = "Sources: " + m.citations.filter(x => /^https?:\/\//.test(x.url)).map(x => `<a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.title)}</a>`).join(" · ");
+          div.appendChild(c);
+        }
+      }
+    } else continue;
+    log.appendChild(div);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+async function loadList() {
+  const { chats } = await api("/api/chats");
+  const box = document.getElementById("chats");
+  box.innerHTML = "";
+  for (const c of chats) {
+    const item = document.createElement("div");
+    item.className = "chat-item" + (current && current.id === c.id ? " active" : "");
+    item.innerHTML = `<span>${esc(c.title)}</span><a class="del" title="Delete">✕</a>`;
+    item.onclick = async () => { current = await api("/api/chat", { id: c.id }); render(current); loadList(); };
+    item.querySelector(".del").onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm("Delete this chat?")) return;
+      await api("/api/delete", { id: c.id });
+      if (current && current.id === c.id) { current = null; render(null); }
+      loadList();
+    };
+    box.appendChild(item);
+  }
+}
+
+async function send(e) {
+  e && e.preventDefault();
+  const input = document.getElementById("input");
+  const text = input.value.trim();
+  if (!text) return;
+  const btn = document.getElementById("send");
+  btn.disabled = true; input.value = "";
+  const pending = current ? structuredClone(current) : { messages: [] };
+  pending.messages.push({ role: "user", content: text }, { role: "assistant", content: "_Thinking…_" });
+  render(pending);
+  try {
+    current = await api("/api/send", { id: current && current.id, text });
+    render(current); loadList();
+  } catch (err) {
+    pending.messages.pop();
+    pending.messages.push({ role: "assistant", content: "**Error:** " + err.message });
+    render(pending); input.value = text;
+  } finally { btn.disabled = false; input.focus(); }
+}
+
+async function verify() {
+  const dot = document.getElementById("vdot"), txt = document.getElementById("vtext");
+  try {
+    const v = await api("/api/verify");
+    if (v.verified) { dot.className = "dot ok"; txt.textContent = `Enclave verified · ${v.repo}@${v.release || "?"}`; txt.title = JSON.stringify(v, null, 2); }
+    else { dot.className = "dot bad"; txt.textContent = `NOT verified (${v.mode}: ${v.url})`; }
+  } catch (err) { dot.className = "dot bad"; txt.textContent = "Enclave check failed: " + err.message; }
+}
+
+document.getElementById("form").onsubmit = send;
+document.getElementById("input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) send(e); });
+document.getElementById("new").onclick = () => { current = null; render(null); loadList(); document.getElementById("input").focus(); };
+const dlg = document.getElementById("settings");
+document.getElementById("open-settings").onclick = async (e) => {
+  e.preventDefault();
+  const s = await api("/api/settings");
+  document.getElementById("folders").value = s.folders.join("\n");
+  document.getElementById("websearch").checked = s.web_search;
+  dlg.showModal();
+};
+document.getElementById("close-settings").onclick = () => dlg.close();
+document.getElementById("save-settings").onclick = async () => {
+  await api("/api/settings", { folders: document.getElementById("folders").value.split("\n"), web_search: document.getElementById("websearch").checked });
+  dlg.close();
+};
+loadList(); verify();
+</script>
+</body>
+</html>

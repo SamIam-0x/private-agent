@@ -1,0 +1,9 @@
+.git
+.env
+.venv
+__pycache__
+README.md
+app.py
+ui.html
+requirements.txt
+*.command

@@ -1,0 +1,28 @@
+# Digest on main is a placeholder. The release workflow rewrites it on the tag.
+# https://docs.tinfoil.sh/containers/building-images
+
+cvm-version: "0.14.12"
+cpus: 2
+memory: 4096
+
+networks:
+  public:
+    egress: open
+
+containers:
+  - name: agent
+    image: "ghcr.io/samiam-0x/private-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    networks: [public]
+    env:
+      - MODEL: "kimi-k3"
+      - PORT: "8080"
+    secrets:
+      - TINFOIL_API_KEY
+      - AGENT_TOKEN
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /health
+    - /chat
+    - /
