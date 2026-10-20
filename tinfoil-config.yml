@@ -2,8 +2,8 @@
 # https://docs.tinfoil.sh/containers/building-images
 
 cvm-version: "0.14.12"
-cpus: 2
-memory: 4096
+cpus: 1
+memory: 2048
 
 networks:
   public:
