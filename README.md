@@ -7,10 +7,7 @@ A small agent that runs inside a [Tinfoil Container](https://docs.tinfoil.sh/con
 
 ## Run the chat page
 
-```bash
-cd ~/Documents/GitHub/private-agent
-.venv/bin/python app.py
-```
+Double-click `start.command` (a Desktop copy calls it). It starts the container if it is stopped, opens the page, and stops the container when the window closes, so it only bills while in use. Log: `~/Library/Logs/private-agent-launcher.log`.
 
 ## Deploy
 
