@@ -34,12 +34,22 @@
   .msg.assistant code { background:var(--panel); padding:1px 4px; border-radius:4px; }
   .msg a { color:var(--accent); }
   .cites { font-size:12px; color:var(--muted); margin-top:6px; }
-  form { display:flex; gap:10px; padding:14px max(20px, calc(50% - 380px)) 20px; border-top:1px solid var(--line); }
+  form { display:flex; gap:10px; }
   textarea { flex:1; resize:none; height:70px; background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:10px; font:inherit; }
   dialog { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:12px; width:520px; }
   dialog textarea { width:100%; height:120px; }
   label { display:block; margin:10px 0 4px; }
   .muted { color:var(--muted); font-size:13px; }
+  .composer { padding:14px max(20px, calc(50% - 380px)) 20px; border-top:1px solid var(--line); }
+  .composer form { padding:0; border:0; }
+  #attach { font-size:18px; padding:8px 12px; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+  .chips:empty { display:none; }
+  .chip { background:var(--line); color:var(--fg); border-radius:999px; padding:3px 10px; font-size:12px; display:inline-flex; gap:6px; align-items:center; }
+  .chip.warn { background:#3a2a12; color:#f0b45a; }
+  .chip a { cursor:pointer; color:var(--muted); }
+  .msg.user .chips { margin:8px 0 0; }
+  body.dragging main { outline:2px dashed var(--accent); outline-offset:-8px; }
 </style>
 </head>
 <body>
@@ -51,10 +61,15 @@
 <main>
   <div id="status"><span><span class="dot" id="vdot"></span><span id="vtext">Checking enclave…</span></span></div>
   <div id="log"></div>
-  <form id="form">
-    <textarea id="input" placeholder="Ask anything. Enter to send, Shift+Enter for a new line."></textarea>
-    <button class="primary" id="send">Send</button>
-  </form>
+  <div class="composer">
+    <div class="chips" id="pending"></div>
+    <form id="form">
+      <button type="button" id="attach" title="Attach files">📎</button>
+      <input type="file" id="file" multiple hidden accept=".pdf,.docx,.xlsx,.xlsm,.csv,.tsv,.txt,.md,.json,.yaml,.yml,.html,.xml,.log,.png,.jpg,.jpeg,.heic,.heif,.webp,.gif,.tif,.tiff">
+      <textarea id="input" placeholder="Ask anything, or attach files (📎 or drag them here). Enter to send."></textarea>
+      <button class="primary" id="send">Send</button>
+    </form>
+  </div>
 </main>
 
 <dialog id="settings">
@@ -102,7 +117,20 @@ function render(chat) {
   log.innerHTML = "";
   for (const m of (chat ? chat.messages : [])) {
     const div = document.createElement("div");
-    if (m.role === "user") { div.className = "msg user"; div.textContent = m.content; }
+    if (m.role === "user") {
+      div.className = "msg user"; div.textContent = m.content;
+      if (m.attachments && m.attachments.length) {
+        const box = document.createElement("div"); box.className = "chips";
+        for (const a of m.attachments) {
+          const chip = document.createElement("span");
+          chip.className = "chip" + (a.note ? " warn" : "");
+          chip.textContent = (a.kind === "image" ? "🖼 " : "📄 ") + a.name + (a.note ? " ⚠" : "");
+          if (a.note) chip.title = a.note;
+          box.appendChild(chip);
+        }
+        div.appendChild(box);
+      }
+    }
     else if (m.role === "tool") { div.className = "msg tool"; div.textContent = `📄 ${m.name || "file tool"} ran on this Mac`; }
     else if (m.role === "assistant") {
       if (m.tool_calls && m.tool_calls.length) {
@@ -144,25 +172,72 @@ async function loadList() {
   }
 }
 
+// Files waiting to be sent with the next message: { name, size, data (base64) }
+let attachments = [];
+const MAX_FILE_MB = 25;
+
+function readBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",", 2)[1] || "");
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+}
+
+async function addFiles(files) {
+  for (const f of files) {
+    if (f.size > MAX_FILE_MB * 1024 * 1024) { alert(`${f.name} is larger than ${MAX_FILE_MB} MB.`); continue; }
+    attachments.push({ name: f.name, size: f.size, data: await readBase64(f) });
+  }
+  renderPending();
+}
+
+function renderPending() {
+  const box = document.getElementById("pending");
+  box.innerHTML = "";
+  attachments.forEach((a, i) => {
+    const chip = document.createElement("span"); chip.className = "chip";
+    chip.textContent = `📄 ${a.name} (${Math.max(1, Math.round(a.size / 1024))} KB) `;
+    const x = document.createElement("a"); x.textContent = "✕"; x.title = "Remove";
+    x.onclick = () => { attachments.splice(i, 1); renderPending(); };
+    chip.appendChild(x); box.appendChild(chip);
+  });
+}
+
 async function send(e) {
   e && e.preventDefault();
   const input = document.getElementById("input");
   const text = input.value.trim();
-  if (!text) return;
+  if (!text && !attachments.length) return;
+  const files = attachments; attachments = []; renderPending();
   const btn = document.getElementById("send");
   btn.disabled = true; input.value = "";
   const pending = current ? structuredClone(current) : { messages: [] };
-  pending.messages.push({ role: "user", content: text }, { role: "assistant", content: "_Thinking…_" });
+  pending.messages.push(
+    { role: "user", content: text, attachments: files.map(f => ({ name: f.name, kind: "file" })) },
+    { role: "assistant", content: files.length ? "_Reading files and thinking…_" : "_Thinking…_" });
   render(pending);
   try {
-    current = await api("/api/send", { id: current && current.id, text });
+    current = await api("/api/send", { id: current && current.id, text, attachments: files.map(f => ({ name: f.name, data: f.data })) });
     render(current); loadList();
   } catch (err) {
     pending.messages.pop();
     pending.messages.push({ role: "assistant", content: "**Error:** " + err.message });
-    render(pending); input.value = text;
+    render(pending); input.value = text; attachments = files; renderPending();
   } finally { btn.disabled = false; input.focus(); }
 }
+
+document.getElementById("attach").onclick = () => document.getElementById("file").click();
+document.getElementById("file").onchange = (e) => { addFiles([...e.target.files]); e.target.value = ""; };
+let dragDepth = 0;
+document.addEventListener("dragenter", e => { if (e.dataTransfer.types.includes("Files")) { dragDepth++; document.body.classList.add("dragging"); } });
+document.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); } });
+document.addEventListener("dragover", e => e.preventDefault());
+document.addEventListener("drop", e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove("dragging");
+  if (e.dataTransfer.files.length) addFiles([...e.dataTransfer.files]);
+});
 
 async function verify() {
   const dot = document.getElementById("vdot"), txt = document.getElementById("vtext");

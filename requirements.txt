@@ -2,3 +2,5 @@ tinfoil==0.14.0
 cryptography
 keyring
 pypdf
+python-docx
+openpyxl

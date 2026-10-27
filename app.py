@@ -188,6 +188,116 @@ def read_text(path: Path) -> str:
     return path.read_text(errors="replace")
 
 
+# ---------- uploaded attachments ----------
+
+MAX_ATTACH_CHARS = 150_000      # per document
+MAX_ATTACH_TOTAL = 400_000      # all documents in one message
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".webp", ".gif", ".tif", ".tiff", ".bmp"}
+
+
+def _docx_text(path: Path) -> str:
+    import docx
+
+    doc = docx.Document(str(path))
+    lines = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            lines.append(" | ".join(cell.text.strip() for cell in row.cells))
+    return "\n".join(lines)
+
+
+def _xlsx_text(path: Path) -> str:
+    import openpyxl
+
+    book = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    out = []
+    for sheet in book.worksheets:
+        out.append(f"[sheet: {sheet.title}]")
+        for row in sheet.iter_rows(values_only=True):
+            if any(v is not None for v in row):
+                out.append(",".join("" if v is None else str(v) for v in row))
+            if sum(len(x) for x in out) > MAX_ATTACH_CHARS:
+                break
+    return "\n".join(out)
+
+
+def _image_data_url(path: Path) -> str:
+    """Convert any image (including HEIC) to a JPEG no larger than 2000px with macOS sips."""
+    import subprocess
+
+    out = path.with_suffix(".converted.jpg")
+    subprocess.run(
+        ["/usr/bin/sips", "-s", "format", "jpeg", "-s", "formatOptions", "85", "-Z", "2000", str(path), "--out", str(out)],
+        check=True, capture_output=True, timeout=60,
+    )
+    return "data:image/jpeg;base64," + base64.b64encode(out.read_bytes()).decode()
+
+
+def prepare_attachment(name: str, data: bytes) -> dict:
+    """Turn an uploaded file into {name, kind: text|image, text|data_url, note}. Runs on the Mac."""
+    import tempfile
+
+    name = Path(name).name or "file"
+    suffix = Path(name).suffix.lower()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / f"upload{suffix}"
+        path.write_bytes(data)
+        if suffix in IMAGE_SUFFIXES:
+            return {"name": name, "kind": "image", "data_url": _image_data_url(path), "note": ""}
+        if suffix == ".pdf":
+            text = read_text(path)
+            if len(re.sub(r"\[page \d+\]", "", text).split()) < 20:
+                return {"name": name, "kind": "text", "text": "",
+                        "note": "No text found. This looks like a scanned PDF; attach the pages as images instead."}
+        elif suffix == ".docx":
+            text = _docx_text(path)
+        elif suffix in (".xlsx", ".xlsm"):
+            text = _xlsx_text(path)
+        else:
+            text = data.decode("utf-8", errors="replace")
+            if text.count("\ufffd") > len(text) // 20 + 5:
+                return {"name": name, "kind": "text", "text": "", "note": "This file type isn't supported."}
+    note = ""
+    if len(text) > MAX_ATTACH_CHARS:
+        note = f"Only the first {MAX_ATTACH_CHARS:,} of {len(text):,} characters were included."
+        text = text[:MAX_ATTACH_CHARS]
+    return {"name": name, "kind": "text", "text": text, "note": note}
+
+
+def api_content(message: dict):
+    """Build the chat-API content for a stored user message, expanding its attachments."""
+    attachments = message.get("attachments") or []
+    if not attachments:
+        return message["content"]
+    text = message["content"]
+    for att in attachments:
+        if att["kind"] == "text" and att.get("text"):
+            text += f'\n\n<attached_file name="{att["name"]}">\n{att["text"]}\n</attached_file>'
+        elif att["kind"] == "text":
+            text += f'\n\n[Attached file "{att["name"]}" could not be read: {att.get("note", "")}]'
+    parts = [{"type": "text", "text": text}]
+    for att in attachments:
+        if att["kind"] == "image":
+            parts.append({"type": "text", "text": f'Attached image: {att["name"]}'})
+            parts.append({"type": "image_url", "image_url": {"url": att["data_url"]}})
+    return parts if len(parts) > 1 else text
+
+
+def public_chat(chat: dict) -> dict:
+    """The chat as the page sees it: attachment names only, not their contents."""
+    out = dict(chat)
+    out["messages"] = []
+    for m in chat["messages"]:
+        m = dict(m)
+        if m.get("attachments"):
+            m["attachments"] = [
+                {"name": a["name"], "kind": a["kind"], "note": a.get("note", ""), "chars": len(a.get("text", ""))}
+                for a in m["attachments"]
+            ]
+        out["messages"].append(m)
+    return out
+
+
 def tool_read_file(args: dict) -> str:
     target = resolve(args.get("path", ""))
     if not target.is_file():
@@ -358,7 +468,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = -1
-        if length < 0 or length > 10_000_000:
+        if length < 0 or length > 60_000_000:
             self.close_connection = True
             return self._send(400, {"error": "bad request"})
         raw = self.rfile.read(length) if length else b""
@@ -373,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/chats":
                 return self._send(200, {"chats": HISTORY.list()})
             if route == "/api/chat":
-                return self._send(200, HISTORY.load(body["id"]))
+                return self._send(200, public_chat(HISTORY.load(body["id"])))
             if route == "/api/delete":
                 HISTORY.delete(body["id"])
                 return self._send(200, {"ok": True})
@@ -388,21 +498,38 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/verify":
                 return self._send(200, AGENT.verification())
             if route == "/api/send":
-                return self._send(200, self._handle_send(body))
+                return self._send(200, public_chat(self._handle_send(body)))
         except Exception as exc:
             return self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
         return self._send(404, {"error": "not found"})
 
     def _handle_send(self, body: dict) -> dict:
         text = str(body.get("text", "")).strip()
-        if not text:
+        attachments = []
+        for item in body.get("attachments") or []:
+            data = base64.b64decode(str(item.get("data", "")), validate=True)
+            attachments.append(prepare_attachment(str(item.get("name", "file")), data))
+        if sum(len(a.get("text", "")) for a in attachments) > MAX_ATTACH_TOTAL:
+            raise ValueError(f"The attached documents are too long together (limit {MAX_ATTACH_TOTAL:,} characters). Attach fewer at once.")
+        if not text and not attachments:
             raise ValueError("empty message")
+        if not text:
+            text = "Please review the attached file" + ("s." if len(attachments) > 1 else ".")
         if body.get("id"):
             chat = HISTORY.load(body["id"])
         else:
-            chat = {"id": uuid.uuid4().hex, "title": text[:60], "created": time.time(), "messages": []}
-        chat["messages"].append({"role": "user", "content": text})
-        api_messages = [{k: v for k, v in m.items() if k not in ("name", "citations")} for m in chat["messages"]]
+            title = text if body.get("text") else ", ".join(a["name"] for a in attachments)
+            chat = {"id": uuid.uuid4().hex, "title": title[:60], "created": time.time(), "messages": []}
+        message = {"role": "user", "content": text}
+        if attachments:
+            message["attachments"] = attachments
+        chat["messages"].append(message)
+        api_messages = []
+        for m in chat["messages"]:
+            m2 = {k: v for k, v in m.items() if k not in ("name", "citations", "attachments")}
+            if m.get("role") == "user":
+                m2["content"] = api_content(m)
+            api_messages.append(m2)
         added, citations = AGENT.ask(api_messages, load_settings()["web_search"])
         if citations:
             added[-1]["citations"] = citations
