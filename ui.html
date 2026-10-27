@@ -73,7 +73,9 @@ let current = null;
 
 async function api(path, body = {}) {
   const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Session": SESSION }, body: JSON.stringify(body) });
-  const data = await r.json();
+  let data;
+  try { data = await r.json(); }
+  catch { throw new Error(`The local server sent an unexpected reply (${r.status}). Reload the page and try again.`); }
   if (!r.ok) throw new Error(data.error || r.statusText);
   return data;
 }

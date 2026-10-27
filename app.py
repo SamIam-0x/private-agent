@@ -352,10 +352,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if not self._host_ok() or self.headers.get("X-Session") != SESSION:
-            return self._send(403, {"error": "forbidden"})
+        # Read the body before any early reply. Browsers reuse connections, so an
+        # unread body would be parsed as the start of the next request.
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > 10_000_000:
+            self.close_connection = True
+            return self._send(400, {"error": "bad request"})
+        raw = self.rfile.read(length) if length else b""
+        if not self._host_ok() or self.headers.get("X-Session") != SESSION:
+            return self._send(403, {"error": "This page is out of date. Reload the page and try again."})
+        try:
+            body = json.loads(raw or b"{}")
         except Exception:
             return self._send(400, {"error": "bad json"})
         route = self.path.split("?", 1)[0]
